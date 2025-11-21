@@ -1,69 +1,52 @@
 import { spawn } from "child_process";
+import {
+  LLMClient,
+  CreateChatCompletionOptions,
+  LLMResponse,
+  AvailableModel,
+} from "@browserbasehq/stagehand";
 import https from "https";
 
-interface LLMMessage {
-  role: string;
-  content: string | any;
-}
-
-interface LLMResponse {
-  id: string;
-  object: string;
-  created: number;
-  model: string;
-  choices: Array<{
-    index: number;
-    message: {
-      role: string;
-      content: string;
-      tool_calls?: any[];
-    };
-    finish_reason: string;
-  }>;
-  usage: {
-    prompt_tokens: number;
-    completion_tokens: number;
-    total_tokens: number;
-  };
-}
-
-interface CustomLLMConfig {
-  apiEndpoint: string;
-  apiKey?: string | null;
-  actualModelName?: string;
-}
-
-function logger(params: { category: string; message: string; level: number }) {
-  const prefix = params.level === 0 ? '[ERROR]' : '[INFO]';
-  console.log(`${prefix} [${params.category}] ${params.message}`);
-}
-
-export class CustomLLMClient {
+export class CustomLLMClient extends LLMClient {
+  readonly type = "custom";
   private apiEndpoint: string;
-  private apiKey: string | null;
+  private apiKey: string | null; // Optional if using OAuth token
   private actualModelName: string;
   private oauthToken: string | null = null;
   private baseURL: string | null = null;
 
-  constructor(config: CustomLLMConfig) {
-    this.apiEndpoint = config.apiEndpoint;
-    this.apiKey = config.apiKey || null;
-    this.actualModelName = config.actualModelName || "gpt-4-1-2025-04-14-eastus-dz";
+  constructor({
+    modelName = "gpt-4o" as AvailableModel,
+    apiEndpoint,
+    apiKey = null,
+    actualModelName = "gpt-4-1-2025-04-14-eastus-dz",
+  }: {
+    modelName?: AvailableModel;
+    apiEndpoint: string;
+    apiKey?: string | null;
+    actualModelName?: string;
+  }) {
+    super(modelName);
+    this.apiEndpoint = apiEndpoint;
+    this.apiKey = apiKey;
+    this.actualModelName = actualModelName;
+    this.hasVision = false;
   }
 
-  async createChatCompletion(options: {
-    messages: LLMMessage[];
-    temperature?: number;
-    maxTokens?: number;
-    response_model?: any;
-  }): Promise<LLMResponse | any> {
-    const { messages, temperature = 0.7, maxTokens = 4096, response_model } = options;
+  async createChatCompletion(
+    params: CreateChatCompletionOptions
+  ): Promise<LLMResponse> {
     let retries = 3;
+    const { messages, temperature, maxTokens } = params;
+    const maxRetries = 3;
 
     // Fetch OAuth token if not yet fetched
     if (!this.oauthToken) {
       try {
-        const tokenResponse = await this.fetchOAuthConfig();
+        const tokenResponse = (await this.fetchOAuthConfig()) as {
+          access_token: string;
+          baseURL?: string;
+        };
         this.oauthToken = tokenResponse.access_token;
         if (tokenResponse.baseURL) {
           this.baseURL = tokenResponse.baseURL;
@@ -83,8 +66,8 @@ export class CustomLLMClient {
       }
     }
 
-    const makeRequest = (): Promise<any> =>
-      new Promise(async (resolve, reject) => {
+    const makeRequest = () =>
+      new Promise<LLMResponse>(async (resolve, reject) => {
         const requestPayload = {
           model: this.actualModelName,
           messages: messages.map((msg) => ({
@@ -97,6 +80,7 @@ export class CustomLLMClient {
         const requestBody = JSON.stringify(requestPayload);
 
         try {
+          // Use baseURL from OAuth config if available, otherwise use apiEndpoint
           const endpoint = this.baseURL ? `${this.baseURL}/chat/completions` : this.apiEndpoint;
           const url = new URL(endpoint);
           const reqOptions = {
@@ -125,6 +109,7 @@ export class CustomLLMClient {
                   reject(new Error(`Failed to parse response: ${responseData}`));
                 }
               } else if (res.statusCode === 401) {
+                // Token possibly expired, clear for refresh
                 this.oauthToken = null;
                 reject(new Error(`Unauthorized – token expired or invalid: ${responseData}`));
               } else {
@@ -145,7 +130,9 @@ export class CustomLLMClient {
     while (retries > 0) {
       try {
         const data = await makeRequest();
-        const messageContent = data?.choices?.[0]?.message?.content || data.content || "";
+        // Construct LLMResponse from API data
+        const messageContent =
+          data?.choices?.[0]?.message?.content || data.content || "";
         const toolCalls =
           Array.isArray(data?.choices?.[0]?.message?.tool_calls) &&
           data.choices[0].message.tool_calls.length > 0
@@ -155,7 +142,7 @@ export class CustomLLMClient {
         if (toolCalls.length > 0) messageObj.tool_calls = toolCalls;
 
         const formattedResponse: LLMResponse = {
-          id: data.id || "custom-" + Date.now(),
+          id: "custom-6b", // Adjust these appropriately
           object: "chat.completion",
           created: Math.floor(Date.now() / 1000),
           model: this.actualModelName,
@@ -173,8 +160,8 @@ export class CustomLLMClient {
           },
         };
 
-        // Optional structured parsing if requested by response_model
-        if (response_model) {
+        // Optional structured parsing if requested by options.response_model
+        if (options.response_model) {
           logger({
             category: "custom-llm",
             message: `Response model requested, parsing: ${messageContent}`,
@@ -184,7 +171,7 @@ export class CustomLLMClient {
             const parsedData = JSON.parse(messageContent);
             logger({
               category: "custom-llm",
-              message: `Parsed ${JSON.stringify(parsedData, null, 2)}`,
+              message: `Parsed  ${JSON.stringify(parsedData, null, 2)}`,
               level: 1,
             });
 
@@ -215,14 +202,14 @@ export class CustomLLMClient {
                 });
 
                 return {
-                  ...normalizedData,
+                   normalizedData,
                   usage: formattedResponse.usage,
                 };
               }
             }
 
             // Other structured responses, return data and usage
-            return { ...parsedData, usage: formattedResponse.usage };
+            return {  parsedData, usage: formattedResponse.usage };
           } catch (e) {
             logger({
               category: "custom-llm",
@@ -240,7 +227,7 @@ export class CustomLLMClient {
                   level: 1,
                 });
                 if (extractedJson.element && extractedJson.action) {
-                  const elementId = extractedJson.element.id?.replace(/[\[\]\s'"]/g, "") || "0-1";
+                  const elementId = extractedJson.element.id?.replace(/[\[\]\s'"]/g, "0-1");
                   const normalizedData = {
                     elementId,
                     method: extractedJson.action,
@@ -258,11 +245,11 @@ export class CustomLLMClient {
                     level: 1,
                   });
                   return {
-                    ...normalizedData,
+                     normalizedData,
                     usage: formattedResponse.usage,
                   };
                 }
-                return { ...extractedJson, usage: formattedResponse.usage };
+                return {  extractedJson, usage: formattedResponse.usage };
               } catch (e2) {
                 logger({
                   category: "custom-llm",
@@ -274,14 +261,15 @@ export class CustomLLMClient {
             return formattedResponse;
           }
         }
-
         return formattedResponse;
-      } catch (error: any) {
+      } catch (error) {
         if (error.message.includes("Unauthorized")) {
           retries--;
           if (retries === 0) throw error;
           try {
-            const tokenResponse = await this.fetchOAuthConfig();
+            const tokenResponse = (await this.fetchOAuthConfig()) as {
+              access_token: string;
+            };
             this.oauthToken = tokenResponse.access_token;
             logger({
               category: "custom-llm",
@@ -305,12 +293,9 @@ export class CustomLLMClient {
             level: 0,
           });
           if (retries <= 0) throw error;
-          retries--;
         }
       }
     }
-
-    throw new Error('Max retries exceeded');
   }
 
   async fetchOAuthConfig(): Promise<any> {
